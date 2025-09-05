@@ -9,7 +9,6 @@ It uses [TMDB](https://www.themoviedb.org/) (for metadata and trailer links) and
 - Strict language mode (skip trailers not matching your chosen language).
 - Works with multiple root directories.
 - Configurable via simple `.ini` file.  
-- Only requires `requests` and `yt-dlp`.
 
 ---
 
@@ -21,10 +20,12 @@ It uses [TMDB](https://www.themoviedb.org/) (for metadata and trailer links) and
   ```
 - Python dependencies (see `requirements.txt`):  
   ```bash
-  pip install -r requirements.txt
+  pip3 install -r requirements.txt
   ```
 
 ---
+
+
 
 ## Configuration
 
@@ -35,6 +36,14 @@ Copy it and edit to fit your environment:
 ```bash
 cp trailers-example.ini trailers.ini
 ```
+
+### API Keys
+
+This tool requires two API keys:  
+TMDB API key → Create a free account and generate a key here: https://www.themoviedb.org/settings/api  
+YouTube Data API key → Create a project in Google Cloud Console, enable the YouTube Data API v3, and generate an API key.
+
+Both keys must be added to the [auth] section of your trailers.ini
 
 ### Example `trailers.ini`
 

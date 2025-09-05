@@ -10,6 +10,7 @@ from typing import Optional, Tuple, List, Dict
 
 import requests
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 # ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -233,21 +234,75 @@ def youtube_search_trailer(title: str, year: Optional[int], youtube_api_key: str
 def download_youtube_to(target_path: str, video_id: str) -> bool:
     url = f"https://www.youtube.com/watch?v={video_id}"
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    log.info(f"⇣ Downloading trailer from {url}")
+
+    # Prefer 1080p; fall back to best <=1080p; then best available.
+    # Try to avoid SABR by using Android client; keep web as secondary.
     ydl_opts = {
         "quiet": True,
         "noprogress": True,
+        "no_warnings": True,  # suppress WARNING lines as much as possible
         "outtmpl": target_path,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+
+        # Quality preference chain:
+        "format": (
+            "bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height=1080]+bestaudio/"
+            "best[height=1080]/"
+            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+            "best[height<=1080]/"
+            "best"
+        ),
+
+        # Stronger sorting towards 1080p and AVC/M4A when possible (keine Pflicht, aber hilft):
+        "format_sort": ["res:1080", "res", "ext:mp4:m4a", "codec:avc", "vbr", "abr"],
+        "format_sort_force": True,
+
+        # Workaround against SABR: allow other YouTube player clients to access full manifests.
+        "extractor_args": {
+            "youtube": {
+                # Order matters; try 'android' first.
+                "player_client": ["android", "ios", "web"]
+            }
+        },
+
+        # Helps in some cases to load DASH/HLS manifests:
+        "youtube_include_dash_manifest": True,
+        "youtube_include_hls_manifest": True,
+
+        # Remux/Convert to MP4 (benötigt ffmpeg):
         "merge_output_format": "mp4",
-        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
+        "postprocessors": [
+            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
+        ],
+        # Fast-starting MP4s:
+        "postprocessor_args": ["-movflags", "+faststart"],
+
+        # Optional, in case of geo quirks: set DE as bypass country
+        "geo_bypass_country": "DE",
     }
+
     with YoutubeDL(ydl_opts) as ydl:
         try:
             ydl.download([url])
             return True
+        except DownloadError as e:
+            # second attempt: if Android/iOS fails, try with 'web' only
+            try:
+                alt_opts = ydl_opts.copy()
+                alt_opts["extractor_args"] = {"youtube": {"player_client": ["web"]}}
+                with YoutubeDL(alt_opts) as ydl2:
+                    ydl2.download([url])
+                    return True
+            except Exception:
+                log.warning(f"yt_dlp failed (alt client) for {url}: {e}")
+                return False
         except Exception as e:
             log.warning(f"yt_dlp failed for {url}: {e}")
             return False
+
+
 
 
 # ---------- Walk & Process ----------
@@ -297,11 +352,15 @@ def process_movie_dir(movie_dir: str, cfg: dict) -> None:
 
     # Strict language handling
     if cfg["strict_language"] and video_id and found_lang != lang_code:
-        log.info(f"✗ TMDB trailer not in requested language ({found_lang}); strict mode → ignore")
+        log.info(
+            f"✗ TMDB trailer not in requested language ({found_lang}); "
+            f"strict mode → ignoring TMDB result, will try YouTube fallback"
+        )
         video_id = None
 
     # YouTube fallback
     if not video_id:
+        log.info("→ Falling back to YouTube search…")
         time.sleep(API_SLEEP)
         video_id = youtube_search_trailer(title, year, cfg["youtube_api_key"], lang_code)
 
