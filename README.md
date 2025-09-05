@@ -6,7 +6,7 @@ It uses [TMDB](https://www.themoviedb.org/) (for metadata and trailer links) and
 ## Features
 - Downloads trailers directly into your movie folders.
 - Configurable language (e.g., German, English, French, …).
-- Strict language mode (skip trailers not matching your chosen language).
+- Strict language mode (ignore TMDB trailers in the wrong language, but still try YouTube fallback in your chosen language).
 - Works with multiple root directories.
 - Configurable via simple `.ini` file.  
 
