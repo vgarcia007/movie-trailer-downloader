@@ -6,6 +6,7 @@ import time
 import logging
 import argparse
 import configparser
+import shutil
 from typing import Optional, Tuple, List, Dict
 
 import requests
@@ -62,6 +63,8 @@ def load_config(path: str):
     video_exts_raw = cfg.get("settings", "video_exts", fallback="mkv,mp4,m4v,avi,mov")
     video_exts = {"."+e.strip().lower().lstrip(".") for e in video_exts_raw.split(",") if e.strip()}
     trailer_suffix = cfg.get("settings", "trailer_suffix", fallback="-trailer").strip()
+    preferred_height = cfg.getint("settings", "preferred_height", fallback=1080)
+    temp_dir = cfg.get("settings", "temp_dir", fallback="/tmp/movie-trailer-downloader").strip()
 
     # paths: every value in [paths] is a root
     roots = []
@@ -82,6 +85,8 @@ def load_config(path: str):
         "video_exts": video_exts,
         "trailer_suffix": trailer_suffix,
         "roots": roots,
+        "preferred_height": preferred_height,
+        "temp_dir": temp_dir,
     }
 
 
@@ -231,78 +236,118 @@ def youtube_search_trailer(title: str, year: Optional[int], youtube_api_key: str
 
 
 # ---------- Download ----------
-def download_youtube_to(target_path: str, video_id: str) -> bool:
+def download_youtube_to(target_path: str, video_id: str, preferred_height: int, temp_dir: str) -> bool:
+    """
+    Download into a dedicated temp directory, then move the finished file
+    into place using shutil.move (copy+remove across devices).
+    Avoids .part files in watched folders and prevents nested tmp paths.
+    """
     url = f"https://www.youtube.com/watch?v={video_id}"
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
 
-    log.info(f"⇣ Downloading trailer from {url}")
+    temp_filename = os.path.basename(target_path)
+    temp_out = os.path.join(temp_dir, temp_filename)
 
-    # Prefer 1080p; fall back to best <=1080p; then best available.
-    # Try to avoid SABR by using Android client; keep web as secondary.
+    # ensure no stale temp file from previous runs
+    try:
+        if os.path.exists(temp_out):
+            os.remove(temp_out)
+    except Exception:
+        pass
+
+    log.info(f"⇣ Downloading trailer from {url} (target={preferred_height}p) → temp: {temp_out}")
+
+    def _hook(d):
+        if d.get("status") == "finished":
+            info = d.get("info_dict", {})
+            height = info.get("height")
+            ext = info.get("ext")
+            vcodec = info.get("vcodec")
+            acodec = info.get("acodec")
+            fmt_id = info.get("format_id")
+            log.info(f"✓ Final format: {height}p {ext} (v:{vcodec} a:{acodec}, id:{fmt_id})")
+
+    h = preferred_height
+    format_str = (
+        f"bestvideo[height={h}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height={h}]+bestaudio/"
+        f"best[height={h}]/"
+        f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"best[height<={h}]/"
+        "best"
+    )
+
     ydl_opts = {
         "quiet": True,
         "noprogress": True,
-        "no_warnings": True,  # suppress WARNING lines as much as possible
-        "outtmpl": target_path,
+        "no_warnings": True,
 
-        # Quality preference chain:
-        "format": (
-            "bestvideo[height=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height=1080]+bestaudio/"
-            "best[height=1080]/"
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "best[height<=1080]/"
-            "best"
-        ),
+        # write final file directly into our temp dir (absolute path!)
+        "outtmpl": temp_out,
 
-        # Stronger sorting towards 1080p and AVC/M4A when possible (keine Pflicht, aber hilft):
-        "format_sort": ["res:1080", "res", "ext:mp4:m4a", "codec:avc", "vbr", "abr"],
+        # route only fragments/.part into temp; DO NOT set "home" to avoid nested tmp paths
+        "paths": {"temp": temp_dir},
+
+        "format": format_str,
+        "format_sort": [f"res:{h}", "res", "ext:mp4:m4a", "codec:avc", "vbr", "abr"],
         "format_sort_force": True,
 
-        # Workaround against SABR: allow other YouTube player clients to access full manifests.
-        "extractor_args": {
-            "youtube": {
-                # Order matters; try 'android' first.
-                "player_client": ["android", "ios", "web"]
-            }
-        },
-
-        # Helps in some cases to load DASH/HLS manifests:
+        # SABR workaround
+        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
         "youtube_include_dash_manifest": True,
         "youtube_include_hls_manifest": True,
 
-        # Remux/Convert to MP4 (benötigt ffmpeg):
+        # robustness
+        "retries": 10,
+        "fragment_retries": 10,
+        "continuedl": True,
+        "ignoreerrors": True,
+
+        # output as mp4
         "merge_output_format": "mp4",
-        "postprocessors": [
-            {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}
-        ],
-        # Fast-starting MP4s:
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
         "postprocessor_args": ["-movflags", "+faststart"],
 
-        # Optional, in case of geo quirks: set DE as bypass country
+        "progress_hooks": [_hook],
         "geo_bypass_country": "DE",
     }
 
-    with YoutubeDL(ydl_opts) as ydl:
-        try:
+    try:
+        from yt_dlp import YoutubeDL
+        with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+        shutil.move(temp_out, target_path)
+        log.info(f"✓ Moved into place: {target_path}")
+        return True
+
+    except DownloadError as e:
+        # retry with web client only
+        try:
+            alt_opts = dict(ydl_opts)
+            alt_opts["extractor_args"] = {"youtube": {"player_client": ["web"]}}
+            with YoutubeDL(alt_opts) as ydl2:
+                ydl2.download([url])
+            shutil.move(temp_out, target_path)
+            log.info(f"✓ Moved into place: {target_path}")
             return True
-        except DownloadError as e:
-            # second attempt: if Android/iOS fails, try with 'web' only
+        except Exception:
+            log.warning(f"yt_dlp failed (alt client) for {url}: {e}")
             try:
-                alt_opts = ydl_opts.copy()
-                alt_opts["extractor_args"] = {"youtube": {"player_client": ["web"]}}
-                with YoutubeDL(alt_opts) as ydl2:
-                    ydl2.download([url])
-                    return True
+                if os.path.exists(temp_out):
+                    os.remove(temp_out)
             except Exception:
-                log.warning(f"yt_dlp failed (alt client) for {url}: {e}")
-                return False
-        except Exception as e:
-            log.warning(f"yt_dlp failed for {url}: {e}")
+                pass
             return False
 
-
+    except Exception as e:
+        log.warning(f"yt_dlp failed for {url}: {e}")
+        try:
+            if os.path.exists(temp_out):
+                os.remove(temp_out)
+        except Exception:
+            pass
+        return False
 
 
 # ---------- Walk & Process ----------
@@ -368,7 +413,7 @@ def process_movie_dir(movie_dir: str, cfg: dict) -> None:
         log.warning(f"✗ No trailer found for '{title}' in lang={lang_code}")
         return
 
-    ok = download_youtube_to(trailer_path, video_id)
+    ok = download_youtube_to(trailer_path, video_id, cfg["preferred_height"], cfg["temp_dir"])
     if ok:
         log.info(f"✔ Saved trailer: {trailer_path}")
     else:

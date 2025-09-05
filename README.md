@@ -40,8 +40,8 @@ cp trailers-example.ini trailers.ini
 ### API Keys
 
 This tool requires two API keys:  
-TMDB API key → Create a free account and generate a key here: https://www.themoviedb.org/settings/api  
-YouTube Data API key → Create a project in Google Cloud Console, enable the YouTube Data API v3, and generate an API key.
+- TMDB API key → Create a free account and generate a key here: https://www.themoviedb.org/settings/api  
+- YouTube Data API key → Create a project in Google Cloud Console, enable the YouTube Data API v3, and generate an API key.
 
 Both keys must be added to the [auth] section of your trailers.ini
 
