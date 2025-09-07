@@ -12,6 +12,8 @@ from typing import Optional, Tuple, List, Dict
 import requests
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+import subprocess
+
 
 # ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -64,6 +66,8 @@ def load_config(path: str):
     video_exts = {"."+e.strip().lower().lstrip(".") for e in video_exts_raw.split(",") if e.strip()}
     trailer_suffix = cfg.get("settings", "trailer_suffix", fallback="-trailer").strip()
     preferred_height = cfg.getint("settings", "preferred_height", fallback=1080)
+    allow_non_mp4 = cfg.getboolean("settings", "allow_non_mp4_for_quality", fallback=True)
+
     temp_dir = cfg.get("settings", "temp_dir", fallback="/tmp/movie-trailer-downloader").strip()
 
     # paths: every value in [paths] is a root
@@ -86,6 +90,7 @@ def load_config(path: str):
         "trailer_suffix": trailer_suffix,
         "roots": roots,
         "preferred_height": preferred_height,
+        "allow_non_mp4_for_quality": allow_non_mp4,
         "temp_dir": temp_dir,
     }
 
@@ -134,6 +139,23 @@ def build_trailer_target_path(movie_path: str, movie_filename: str, suffix: str)
     base, _ = os.path.splitext(movie_filename)
     return os.path.join(movie_path, f"{base}{suffix}.mp4")
 
+def get_video_height(path: str) -> Optional[int]:
+    """
+    Return the height (in pixels) of the first video stream using ffprobe.
+    Returns None if probing fails.
+    """
+    try:
+        # -v error: only errors, -select_streams v:0: first video stream
+        # -show_entries stream=height: print height, -of csv=p=0: plain number
+        out = subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=height", "-of", "csv=p=0", path
+        ], stderr=subprocess.STDOUT, text=True).strip()
+        if out.isdigit():
+            return int(out)
+    except Exception:
+        pass
+    return None
 
 # ---------- TMDB ----------
 def tmdb_search_movie(title: str, year: Optional[int], tmdb_api_key: str, tmdb_locale: str) -> Optional[int]:
@@ -236,40 +258,43 @@ def youtube_search_trailer(title: str, year: Optional[int], youtube_api_key: str
 
 
 # ---------- Download ----------
-def download_youtube_to(target_path: str, video_id: str, preferred_height: int, temp_dir: str) -> bool:
+def download_youtube_to(
+    target_path: str,
+    video_id: str,
+    preferred_height: int,
+    temp_dir: str,
+    allow_non_mp4_for_quality: bool,
+    existing_height: Optional[int] = None
+) -> bool:
     """
-    Download into a dedicated temp directory, then move the finished file
-    into place using shutil.move (copy+remove across devices).
-    Avoids .part files in watched folders and prevents nested tmp paths.
+    Download into temp, prefer MP4; optionally retry with ANY→MKV for quality.
+    Only replace the existing trailer if the new file's height is strictly greater
+    than existing_height (or if no existing trailer).
     """
     url = f"https://www.youtube.com/watch?v={video_id}"
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
 
-    temp_filename = os.path.basename(target_path)
-    temp_out = os.path.join(temp_dir, temp_filename)
+    base_filename = os.path.basename(target_path)  # ...-trailer.mp4 (by builder)
+    temp_mp4 = os.path.join(temp_dir, base_filename)
 
-    # ensure no stale temp file from previous runs
-    try:
-        if os.path.exists(temp_out):
-            os.remove(temp_out)
-    except Exception:
-        pass
+    def _hook(label):
+        def inner(d):
+            if d.get("status") == "finished":
+                info = d.get("info_dict", {})
+                h = info.get("height")
+                ext = info.get("ext")
+                vcodec = info.get("vcodec")
+                acodec = info.get("acodec")
+                fmt_id = info.get("format_id")
+                log.info(f"✓ {label}: {h}p {ext} (v:{vcodec} a:{acodec}, id:{fmt_id})")
+        return inner
 
-    log.info(f"⇣ Downloading trailer from {url} (target={preferred_height}p) → temp: {temp_out}")
-
-    def _hook(d):
-        if d.get("status") == "finished":
-            info = d.get("info_dict", {})
-            height = info.get("height")
-            ext = info.get("ext")
-            vcodec = info.get("vcodec")
-            acodec = info.get("acodec")
-            fmt_id = info.get("format_id")
-            log.info(f"✓ Final format: {height}p {ext} (v:{vcodec} a:{acodec}, id:{fmt_id})")
+    def probe_height(p: str) -> Optional[int]:
+        return get_video_height(p)
 
     h = preferred_height
-    format_str = (
+    format_str_mp4 = (
         f"bestvideo[height={h}][ext=mp4]+bestaudio[ext=m4a]/"
         f"bestvideo[height={h}]+bestaudio/"
         f"best[height={h}]/"
@@ -278,77 +303,164 @@ def download_youtube_to(target_path: str, video_id: str, preferred_height: int, 
         "best"
     )
 
-    ydl_opts = {
+    ydl_opts_mp4 = {
         "quiet": True,
         "noprogress": True,
         "no_warnings": True,
-
-        # write final file directly into our temp dir (absolute path!)
-        "outtmpl": temp_out,
-
-        # route only fragments/.part into temp; DO NOT set "home" to avoid nested tmp paths
+        "outtmpl": temp_mp4,
         "paths": {"temp": temp_dir},
-
-        "format": format_str,
+        "format": format_str_mp4,
         "format_sort": [f"res:{h}", "res", "ext:mp4:m4a", "codec:avc", "vbr", "abr"],
         "format_sort_force": True,
-
-        # SABR workaround
         "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
         "youtube_include_dash_manifest": True,
         "youtube_include_hls_manifest": True,
-
-        # robustness
         "retries": 10,
         "fragment_retries": 10,
         "continuedl": True,
         "ignoreerrors": True,
-
-        # output as mp4
         "merge_output_format": "mp4",
         "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
         "postprocessor_args": ["-movflags", "+faststart"],
-
-        "progress_hooks": [_hook],
+        "progress_hooks": [_hook("MP4 pass")],
         "geo_bypass_country": "DE",
     }
 
+    # Ensure no stale temp file
+    try:
+        if os.path.exists(temp_mp4):
+            os.remove(temp_mp4)
+    except Exception:
+        pass
+
+    log.info(f"⇣ Downloading trailer (MP4-first) from {url} (target={preferred_height}p) → temp: {temp_mp4}")
+
+    # ---------- First pass: MP4 ----------
     try:
         from yt_dlp import YoutubeDL
-        with YoutubeDL(ydl_opts) as ydl:
+        with YoutubeDL(ydl_opts_mp4) as ydl:
             ydl.download([url])
-        shutil.move(temp_out, target_path)
-        log.info(f"✓ Moved into place: {target_path}")
-        return True
 
-    except DownloadError as e:
-        # retry with web client only
-        try:
-            alt_opts = dict(ydl_opts)
-            alt_opts["extractor_args"] = {"youtube": {"player_client": ["web"]}}
-            with YoutubeDL(alt_opts) as ydl2:
-                ydl2.download([url])
-            shutil.move(temp_out, target_path)
-            log.info(f"✓ Moved into place: {target_path}")
-            return True
-        except Exception:
-            log.warning(f"yt_dlp failed (alt client) for {url}: {e}")
+        new_h = probe_height(temp_mp4)
+        if new_h:
+            log.info(f"• MP4 pass result height: {new_h}p")
+        else:
+            log.info("• MP4 pass: could not probe height")
+
+        # Decide whether to replace existing file
+        if existing_height is None or (new_h and new_h > existing_height):
+            # Replace/move into place; allow switching container extension if needed later
+            shutil.move(temp_mp4, target_path)
+            log.info(f"✓ Placed (MP4): {target_path}")
+            # If we already hit preferred height, done.
+            if new_h and new_h >= preferred_height:
+                return True
+            # Otherwise, we *might* upgrade further with MKV pass if allowed
+        else:
+            log.info(f"↺ Existing trailer is equal or better ({existing_height}p) → keep existing, discard MP4")
             try:
-                if os.path.exists(temp_out):
-                    os.remove(temp_out)
+                if os.path.exists(temp_mp4):
+                    os.remove(temp_mp4)
             except Exception:
                 pass
-            return False
+            # No need to try MKV in this case
+            return True
 
+    except DownloadError as e:
+        log.info("… MP4 pass failed or incomplete; evaluating MKV fallback")
     except Exception as e:
-        log.warning(f"yt_dlp failed for {url}: {e}")
+        log.warning(f"yt_dlp failed (MP4 pass) for {url}: {e}")
+
+    # ---------- Second pass: ANY → MKV (optional) ----------
+    if not allow_non_mp4_for_quality:
+        # Clean temp mp4 if left
         try:
-            if os.path.exists(temp_out):
-                os.remove(temp_out)
+            if os.path.exists(temp_mp4):
+                os.remove(temp_mp4)
         except Exception:
             pass
         return False
 
+    mkv_target = os.path.splitext(target_path)[0] + ".mkv"
+    temp_mkv = os.path.join(temp_dir, os.path.basename(mkv_target))
+
+    format_str_any = (
+        f"bestvideo[height={h}]+bestaudio/"
+        f"best[height={h}]/"
+        f"bestvideo[height<={h}]+bestaudio/"
+        f"best[height<={h}]/"
+        "best"
+    )
+
+    ydl_opts_mkv = dict(ydl_opts_mp4)
+    ydl_opts_mkv.update({
+        "outtmpl": temp_mkv,
+        "format": format_str_any,
+        "format_sort": [f"res:{h}", "res", "vbr", "abr"],  # drop ext bias
+        "merge_output_format": "mkv",
+        "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mkv"}],
+        "progress_hooks": [_hook("MKV pass")],
+    })
+
+    # Ensure no stale temp mkv
+    try:
+        if os.path.exists(temp_mkv):
+            os.remove(temp_mkv)
+    except Exception:
+        pass
+
+    log.info(f"⇣ Retrying for quality (ANY→MKV) from {url} (target={preferred_height}p) → temp: {temp_mkv}")
+
+    try:
+        with YoutubeDL(ydl_opts_mkv) as ydl2:
+            ydl2.download([url])
+
+        new_h2 = probe_height(temp_mkv)
+        if new_h2:
+            log.info(f"• MKV pass result height: {new_h2}p")
+        else:
+            log.info("• MKV pass: could not probe height")
+
+        # Compare against existing (or MP4 just placed)
+        current_path = None
+        # prefer current mkv/mp4 present at target base
+        base_no_ext, _ = os.path.splitext(target_path)
+        mp4_current = base_no_ext + ".mp4"
+        mkv_current = base_no_ext + ".mkv"
+        if os.path.exists(mkv_current):
+            current_path = mkv_current
+        elif os.path.exists(mp4_current):
+            current_path = mp4_current
+
+        current_h = get_video_height(current_path) if current_path else None
+
+        if current_h is None or (new_h2 and new_h2 > current_h):
+            # Remove the older current file if exists, then move MKV in place
+            try:
+                if current_path and os.path.exists(current_path):
+                    os.remove(current_path)
+            except Exception:
+                pass
+            shutil.move(temp_mkv, mkv_target)
+            log.info(f"✓ Upgraded (MKV): {mkv_target}")
+            return True
+        else:
+            log.info(f"↺ MKV not better than existing ({current_h or 'unknown'}p) → discard MKV")
+            try:
+                if os.path.exists(temp_mkv):
+                    os.remove(temp_mkv)
+            except Exception:
+                pass
+            return True
+
+    except Exception as e2:
+        log.warning(f"yt_dlp failed (MKV pass) for {url}: {e2}")
+        try:
+            if os.path.exists(temp_mkv):
+                os.remove(temp_mkv)
+        except Exception:
+            pass
+        return False
 
 # ---------- Walk & Process ----------
 def walk_movies(root_dir: str) -> List[str]:
@@ -365,15 +477,46 @@ def first_movie_file_in_dir(dir_path: str, video_exts: set) -> Optional[str]:
     return first_movie_file(dir_path, video_exts)
 
 def process_movie_dir(movie_dir: str, cfg: dict) -> None:
+    """
+    Process a single movie folder:
+    - detect existing trailer (mp4/mkv) and probe its height
+    - if existing >= preferred_height: skip
+    - else search TMDB (language-aware) then fall back to YouTube
+    - download into temp dir and only replace if the new trailer has higher height
+    """
+    # 1) Find main movie file in this folder
     movie_file = first_movie_file_in_dir(movie_dir, cfg["video_exts"])
     if not movie_file:
         return
 
+    # 2) Build target trailer path (defaults to ...-trailer.mp4)
     trailer_path = build_trailer_target_path(movie_dir, movie_file, cfg["trailer_suffix"])
-    if os.path.exists(trailer_path) and os.path.getsize(trailer_path) > 0:
-        log.info(f"✓ Trailer already exists: {trailer_path}")
-        return
 
+    # 3) Detect existing trailer (prefer MKV over MP4, if both exist)
+    base_no_ext, _ = os.path.splitext(trailer_path)  # points to ...-trailer
+    mp4_path = base_no_ext + ".mp4"
+    mkv_path = base_no_ext + ".mkv"
+
+    existing_trailer_path = None
+    if os.path.exists(mkv_path):
+        existing_trailer_path = mkv_path
+    elif os.path.exists(mp4_path):
+        existing_trailer_path = mp4_path
+
+    existing_height = None
+    if existing_trailer_path:
+        existing_height = get_video_height(existing_trailer_path)
+        if existing_height is not None:
+            log.info(f"• Existing trailer: {existing_trailer_path} ({existing_height}p)")
+            if existing_height >= cfg["preferred_height"]:
+                log.info(f"✓ Already at or above preferred height ({cfg['preferred_height']}p) → skip")
+                return
+            else:
+                log.info(f"↻ Below preferred height ({cfg['preferred_height']}p) → will try to upgrade")
+        else:
+            log.info("• Existing trailer found but height unknown → will attempt upgrade if better is available")
+
+    # 4) Extract title/year from folder (fallback to filename)
     folder_name = os.path.basename(movie_dir.rstrip(os.sep))
     title, year = extract_title_year_from_folder(folder_name)
     if len(title) < 2:
@@ -381,11 +524,13 @@ def process_movie_dir(movie_dir: str, cfg: dict) -> None:
         title = t2 or title
         year = y2 or year
 
+    # 5) Language/locale setup
     lang_code = cfg["language"]
     tmdb_locale, _, _ = LANG_MAP.get(lang_code, ("en-US", "US", "English"))
+
     log.info(f"→ Searching trailer for: '{title}' ({year or 'unknown'}) lang={lang_code}")
 
-    # TMDB first
+    # 6) TMDB first
     video_id = None
     found_lang = None
     movie_id = tmdb_search_movie(title, year, cfg["tmdb_api_key"], tmdb_locale)
@@ -395,7 +540,7 @@ def process_movie_dir(movie_dir: str, cfg: dict) -> None:
         if key:
             video_id = key
 
-    # Strict language handling
+    # 7) Strict handling: ignore TMDB result in wrong language (but log we will fallback)
     if cfg["strict_language"] and video_id and found_lang != lang_code:
         log.info(
             f"✗ TMDB trailer not in requested language ({found_lang}); "
@@ -403,7 +548,7 @@ def process_movie_dir(movie_dir: str, cfg: dict) -> None:
         )
         video_id = None
 
-    # YouTube fallback
+    # 8) YouTube fallback if needed
     if not video_id:
         log.info("→ Falling back to YouTube search…")
         time.sleep(API_SLEEP)
@@ -413,16 +558,21 @@ def process_movie_dir(movie_dir: str, cfg: dict) -> None:
         log.warning(f"✗ No trailer found for '{title}' in lang={lang_code}")
         return
 
-    ok = download_youtube_to(trailer_path, video_id, cfg["preferred_height"], cfg["temp_dir"])
+    # 9) Download to temp and conditionally replace only if it improves height
+    ok = download_youtube_to(
+        trailer_path,
+        video_id,
+        cfg["preferred_height"],
+        cfg["temp_dir"],
+        cfg["allow_non_mp4_for_quality"],
+        existing_height=existing_height,
+    )
+
     if ok:
-        log.info(f"✔ Saved trailer: {trailer_path}")
+        log.info(f"✔ Done: {trailer_path if os.path.exists(trailer_path) else (base_no_ext + '.mkv')}")
     else:
-        try:
-            if os.path.exists(trailer_path) and os.path.getsize(trailer_path) == 0:
-                os.remove(trailer_path)
-        except Exception:
-            pass
         log.warning(f"✗ Download failed for '{title}'")
+
 
 
 # ---------- Main ----------
