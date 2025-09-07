@@ -50,17 +50,22 @@ Both keys must be added to the [auth] section of your trailers.ini
 
 ```ini
 [auth]
-tmdb_api_key = YOUR_TMDB_API_KEY
-youtube_api_key = YOUR_YOUTUBE_API_KEY
+tmdb_api_key = xxx
+youtube_api_key = xxx
 
 [settings]
-language = de
-strict_language = false
+language = en
+strict_language = true
 video_exts = mkv, mp4, m4v, avi, mov
 trailer_suffix = -trailer
+preferred_height = 1080
+allow_non_mp4_for_quality = true
+temp_dir = ./tmp
 
 [paths]
+# All values in this section are used as search directories
 root1 = /home/pi/NAS/media/filme
+# root2 = /some/other/directory
 ```
 
 ---
