@@ -110,4 +110,3 @@ It will scan all root directories defined in `[paths]` and fetch trailers where 
 ## Notes
 - If no trailer is found in your chosen language and `strict_language` is `false`, it may fall back to another available trailer.  
 - If `strict_language` is `true`, only exact language matches will be downloaded.  
-- Trailers are always saved as `.mp4` for maximum compatibility.
