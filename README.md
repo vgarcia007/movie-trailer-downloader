@@ -3,6 +3,11 @@
 A simple Python tool to automatically download movie trailers in your preferred language and save them next to your local movie files.  
 It uses [TMDB](https://www.themoviedb.org/) (for metadata and trailer links) and [YouTube](https://www.youtube.com/) (for fallback searches) combined with [yt-dlp](https://github.com/yt-dlp/yt-dlp) for downloading.  
 
+## Motivation
+
+I use the Arr suite to manage my media, but I was never satisfied with Trailarr or other methods to fetch matching trailers in my language. That’s why I built this script. No nonsense: no web interface, no Docker, just a plain Python script you can run on demand or via cron. It doesn’t matter where it runs, as long as it can access your movie folders. The only requirement is free API keys for YouTube and TMDB.
+
+
 ## Features
 - Downloads trailers directly into your movie folders.
 - Configurable language (e.g., German, English, French, …).
