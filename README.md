@@ -9,6 +9,7 @@ It uses [TMDB](https://www.themoviedb.org/) (for metadata and trailer links) and
 - Strict language mode (ignore TMDB trailers in the wrong language, but still try YouTube fallback in your chosen language).
 - Works with multiple root directories.
 - Configurable via simple `.ini` file.  
+- Replace old trailer files if a higher resolution version is found
 
 ---
 
